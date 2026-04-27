@@ -318,6 +318,30 @@ class ImageGenerator:
         return self._cancel_event.is_set()
 
     @staticmethod
+    def _is_retryable_http_status(status_code, error_text=""):
+        if status_code in (502, 503, 429):
+            return True
+        if status_code >= 500 and "upstream" in str(error_text or "").lower():
+            return True
+        return False
+
+    @staticmethod
+    def _is_retryable_request_exception(exc):
+        return isinstance(
+            exc,
+            (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+                httpx.TransportError,
+            ),
+        )
+
+    @staticmethod
+    def _retry_delay_seconds(attempt):
+        return min(RETRY_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 3), 60)
+
+    @staticmethod
     def _read_stream_error(resp):
         try:
             raw = resp.read()
@@ -2092,46 +2116,89 @@ class ImageGenerator:
             "output_format": output_format,
         })
 
-        try:
-            with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-                self._set_active_request(client=client)
-                payload_meta = debug_log.save_request_payload(
-                    route=f"{self.api_base}/images/generations",
-                    request_kind="json",
-                    request_body=request_body,
-                    note="images_generate",
-                    attempt=1,
-                )
-                debug_log.log("request_payload_saved", payload_meta)
-                resp = client.post(
-                    f"{self.api_base}/images/generations",
-                    headers=self._headers(),
-                    json=request_body,
-                )
-                self._set_active_request(client=client, response=resp)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+                    self._set_active_request(client=client)
+                    payload_meta = debug_log.save_request_payload(
+                        route=f"{self.api_base}/images/generations",
+                        request_kind="json",
+                        request_body=request_body,
+                        note="images_generate",
+                        attempt=attempt,
+                    )
+                    debug_log.log("request_payload_saved", payload_meta)
+                    resp = client.post(
+                        f"{self.api_base}/images/generations",
+                        headers=self._headers(),
+                        json=request_body,
+                    )
+                    self._set_active_request(client=client, response=resp)
+                    if self._cancel_event.is_set():
+                        return
+                    if resp.status_code != 200:
+                        err_text = resp.text[:300]
+                        debug_log.log("http_error", {
+                            "attempt": str(attempt),
+                            "status_code": str(resp.status_code),
+                            "error_text": err_text,
+                            "route": "/images/generations",
+                            "model": model,
+                        })
+                        if self._is_retryable_http_status(resp.status_code, err_text) and attempt < MAX_RETRIES:
+                            if on_partial:
+                                on_partial(None, attempt)
+                            delay = self._retry_delay_seconds(attempt)
+                            debug_log.log("retry_scheduled", {
+                                "attempt": str(attempt),
+                                "delay_sec": f"{delay:.1f}",
+                                "status_code": str(resp.status_code),
+                                "retry_mode": "images_generate",
+                            })
+                            if self._cancelable_sleep(delay):
+                                return
+                            continue
+                        if on_error:
+                            on_error(f"HTTP {resp.status_code}: {err_text}")
+                        return
+                    data = resp.json()
+                    b64, revised_prompt, response_id = self._decode_image_api_payload(data)
+                    if not b64:
+                        if on_error:
+                            on_error("图片接口未返回 b64_json")
+                        return
+                    if on_partial:
+                        on_partial(b64, 1)
+                    if on_done:
+                        on_done(b64, 1, revised_prompt, response_id)
+                    return
+            except Exception as e:
                 if self._cancel_event.is_set():
                     return
-                if resp.status_code != 200:
-                    if on_error:
-                        on_error(f"HTTP {resp.status_code}: {resp.text[:300]}")
-                    return
-                data = resp.json()
-                b64, revised_prompt, response_id = self._decode_image_api_payload(data)
-                if not b64:
-                    if on_error:
-                        on_error("图片接口未返回 b64_json")
-                    return
-                if on_partial:
-                    on_partial(b64, 1)
-                if on_done:
-                    on_done(b64, 1, revised_prompt, response_id)
-        except Exception as e:
-            if self._cancel_event.is_set():
+                debug_log.log("request_exception", {
+                    "attempt": str(attempt),
+                    "route": "/images/generations",
+                    "model": model,
+                    "error": str(e)[:500],
+                })
+                if self._is_retryable_request_exception(e) and attempt < MAX_RETRIES:
+                    if on_partial:
+                        on_partial(None, attempt)
+                    delay = self._retry_delay_seconds(attempt)
+                    debug_log.log("retry_scheduled", {
+                        "attempt": str(attempt),
+                        "delay_sec": f"{delay:.1f}",
+                        "retry_mode": "images_generate_exception",
+                        "error": type(e).__name__,
+                    })
+                    if self._cancelable_sleep(delay):
+                        return
+                    continue
+                if on_error:
+                    on_error(str(e))
                 return
-            if on_error:
-                on_error(str(e))
-        finally:
-            self._clear_active_request()
+            finally:
+                self._clear_active_request()
 
     def _images_edit_worker(self, prompt, image_b64, size, output_format, quality,
                             output_compression, mask_b64, on_partial, on_done, on_error):
@@ -2203,48 +2270,91 @@ class ImageGenerator:
             "prepared_image_size": str(prepared_size) if prepared_size else "",
         })
 
-        try:
-            with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-                self._set_active_request(client=client)
-                payload_meta = debug_log.save_request_payload(
-                    route=f"{self.api_base}/images/edits",
-                    request_kind="multipart",
-                    form_data=data,
-                    files=files,
-                    note="images_edit",
-                    attempt=1,
-                )
-                debug_log.log("request_payload_saved", payload_meta)
-                resp = client.post(
-                    f"{self.api_base}/images/edits",
-                    headers=self._multipart_headers(self.auth_token),
-                    data=data,
-                    files=files,
-                )
-                self._set_active_request(client=client, response=resp)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+                    self._set_active_request(client=client)
+                    payload_meta = debug_log.save_request_payload(
+                        route=f"{self.api_base}/images/edits",
+                        request_kind="multipart",
+                        form_data=data,
+                        files=files,
+                        note="images_edit",
+                        attempt=attempt,
+                    )
+                    debug_log.log("request_payload_saved", payload_meta)
+                    resp = client.post(
+                        f"{self.api_base}/images/edits",
+                        headers=self._multipart_headers(self.auth_token),
+                        data=data,
+                        files=files,
+                    )
+                    self._set_active_request(client=client, response=resp)
+                    if self._cancel_event.is_set():
+                        return
+                    if resp.status_code != 200:
+                        err_text = resp.text[:300]
+                        debug_log.log("http_error", {
+                            "attempt": str(attempt),
+                            "status_code": str(resp.status_code),
+                            "error_text": err_text,
+                            "route": "/images/edits",
+                            "model": model,
+                        })
+                        if self._is_retryable_http_status(resp.status_code, err_text) and attempt < MAX_RETRIES:
+                            if on_partial:
+                                on_partial(None, attempt)
+                            delay = self._retry_delay_seconds(attempt)
+                            debug_log.log("retry_scheduled", {
+                                "attempt": str(attempt),
+                                "delay_sec": f"{delay:.1f}",
+                                "status_code": str(resp.status_code),
+                                "retry_mode": "images_edit",
+                            })
+                            if self._cancelable_sleep(delay):
+                                return
+                            continue
+                        if on_error:
+                            on_error(f"HTTP {resp.status_code}: {err_text}")
+                        return
+                    payload = resp.json()
+                    b64, revised_prompt, response_id = self._decode_image_api_payload(payload)
+                    if not b64:
+                        if on_error:
+                            on_error("图片编辑接口未返回 b64_json")
+                        return
+                    if on_partial:
+                        on_partial(b64, 1)
+                    if on_done:
+                        on_done(b64, 1, revised_prompt, response_id)
+                    return
+            except Exception as e:
                 if self._cancel_event.is_set():
                     return
-                if resp.status_code != 200:
-                    if on_error:
-                        on_error(f"HTTP {resp.status_code}: {resp.text[:300]}")
-                    return
-                payload = resp.json()
-                b64, revised_prompt, response_id = self._decode_image_api_payload(payload)
-                if not b64:
-                    if on_error:
-                        on_error("图片编辑接口未返回 b64_json")
-                    return
-                if on_partial:
-                    on_partial(b64, 1)
-                if on_done:
-                    on_done(b64, 1, revised_prompt, response_id)
-        except Exception as e:
-            if self._cancel_event.is_set():
+                debug_log.log("request_exception", {
+                    "attempt": str(attempt),
+                    "route": "/images/edits",
+                    "model": model,
+                    "error": str(e)[:500],
+                })
+                if self._is_retryable_request_exception(e) and attempt < MAX_RETRIES:
+                    if on_partial:
+                        on_partial(None, attempt)
+                    delay = self._retry_delay_seconds(attempt)
+                    debug_log.log("retry_scheduled", {
+                        "attempt": str(attempt),
+                        "delay_sec": f"{delay:.1f}",
+                        "retry_mode": "images_edit_exception",
+                        "error": type(e).__name__,
+                    })
+                    if self._cancelable_sleep(delay):
+                        return
+                    continue
+                if on_error:
+                    on_error(str(e))
                 return
-            if on_error:
-                on_error(str(e))
-        finally:
-            self._clear_active_request()
+            finally:
+                self._clear_active_request()
 
     @staticmethod
     def _build_responses_edit_prompt(prompt, has_mask, mask_guidance=None,
