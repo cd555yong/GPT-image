@@ -1,0 +1,17 @@
+{
+  "api_base": "http://127.0.0.1:5101/v1",
+  "model": "gpt-image-2",
+  "model_options": [
+    "gpt-image-2",
+    "gpt-image-1.5",
+    "gpt-image-1",
+    "gpt-image-1-mini"
+  ],
+  "auth": "",
+  "size": "1024x1024",
+  "format": "png",
+  "quality": "high",
+  "style": "无（原始）",
+  "batch": 1,
+  "compression": 100
+}
