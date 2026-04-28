@@ -1348,7 +1348,12 @@ class ImageGenerator:
 
     @staticmethod
     def _build_mask_reference_image(image_b64, mask_b64):
-        """Create a second guide image that highlights the editable region on top of the source image."""
+        """Create a second guide image that highlights the editable region on top of the source image.
+
+        The non-editable area is left unchanged (original image) so the model can clearly see
+        what should be preserved. Only the painted (editable) region gets a red overlay,
+        plus a bold red rectangle border to make the target obvious.
+        """
         info = ImageGenerator._get_mask_region_info(mask_b64)
         if not info:
             return None
@@ -1361,16 +1366,16 @@ class ImageGenerator:
             editable_alpha = info["editable_alpha"]
             left, top, right, bottom = info["bbox"]
             pad = max(6, int(round(min(base.size) * 0.03)))
-            stroke = max(3, int(round(min(base.size) * 0.012)))
+            stroke = max(4, int(round(min(base.size) * 0.015)))
 
-            outside = Image.new("RGBA", preview.size, (0, 0, 0, 0))
-            outside.putalpha(editable_alpha.point(lambda value: 0 if value > 0 else 82))
-            preview = Image.alpha_composite(preview, outside)
-
+            # Apply red overlay ONLY on the editable (painted) region — do NOT darken the rest.
+            # This keeps the preserved area visually identical to the original so the model
+            # can clearly distinguish "red = edit here" from "unchanged = do not touch".
             highlight = Image.new("RGBA", preview.size, (255, 52, 52, 0))
-            highlight.putalpha(editable_alpha.point(lambda value: 0 if value <= 0 else max(96, min(168, int(value * 0.72)))))
+            highlight.putalpha(editable_alpha.point(lambda value: 0 if value <= 0 else max(120, min(200, int(value * 0.80)))))
             preview = Image.alpha_composite(preview, highlight)
 
+            # Draw a thick red border around the editable bbox
             draw = ImageDraw.Draw(preview)
             x0 = max(0, left - pad)
             y0 = max(0, top - pad)
@@ -1502,11 +1507,6 @@ class ImageGenerator:
             base_color = (128, 128, 128, 255)
             canvas = Image.new("RGBA", base.size, base_color)
 
-            # Paste the original image content only in the editable (masked) region
-            # editable_alpha: 255 where user painted (editable), 0 elsewhere
-            mask_rgba = Image.new("RGBA", base.size, (0, 0, 0, 0))
-            mask_rgba.putalpha(editable_alpha)
-
             # Composite: canvas as background, original image visible only through mask
             result = Image.composite(base, canvas, editable_alpha.convert("L"))
 
@@ -1565,13 +1565,16 @@ class ImageGenerator:
             ),
             "object": (
                 "Detected scope preference: object-level fix. "
-                "Treat the painted selection as a pointer to the intended nearby object or logically connected part. "
-                "If the user painted only part of an object, you may complete the edit across the whole relevant object while keeping the rest of the scene unchanged."
+                "Treat the painted selection as a pointer to the intended object. "
+                "You may edit the visible portion of the painted object within the painted region, "
+                "but do NOT extend the edit to symmetric, duplicate, or similar objects outside the painted region. "
+                "For example, if one eye is painted, only edit that eye — never the other eye."
             ),
             "auto": (
                 "Infer the edit scope from the user's wording and the image content. "
-                "Use a tight scope for tiny defects or text, a modest nearby scope for local area changes, "
-                "and a whole-object scope only when the request is clearly about a full nearby object or connected part."
+                "Use a tight scope for tiny defects or text, a modest nearby scope for local area changes. "
+                "Only use a whole-object scope when the painted region clearly covers the entire object AND the user's request explicitly targets that whole object. "
+                "Never extend edits to symmetric, duplicate, or similar objects outside the painted region."
             ),
         }
         return guidance.get(scope_mode, guidance["auto"])
@@ -2439,10 +2442,10 @@ class ImageGenerator:
             if scope_guidance:
                 guard += scope_guidance + " "
             guard += (
-                "The painted selection indicates where the user is pointing, but it is not automatically a hard pixel boundary. "
-                "Keep unrelated areas unchanged. For precise local fixes, stay as tight as possible. "
-                "For nearby range fixes, you may extend modestly beyond the painted pixels when needed for a coherent local result. "
-                "For object-level fixes, you may complete the whole nearby object or logically connected part even if only part of it is painted. "
+                "CRITICAL: The painted/red-highlighted region is a STRICT boundary — you must ONLY modify content inside that region. "
+                "Do NOT extend the edit to any area outside the painted region, even if it seems logically connected or symmetric. "
+                "For example, if only one eye is painted, do NOT change the other eye. If only one hand is painted, do NOT change the other hand. "
+                "Keep ALL areas outside the painted region pixel-identical to the original image. "
                 "Preserve object count, geometry, placement, perspective, and lighting unless the user explicitly asks to change them. "
                 "If the user asks for only a color, material, texture, or text change, modify only that attribute and keep geometry and fine details unchanged. "
             )
