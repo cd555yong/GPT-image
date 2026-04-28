@@ -1566,15 +1566,15 @@ class ImageGenerator:
             "object": (
                 "Detected scope preference: object-level fix. "
                 "Treat the painted selection as a pointer to the intended object. "
-                "You may edit the visible portion of the painted object within the painted region, "
-                "but do NOT extend the edit to symmetric, duplicate, or similar objects outside the painted region. "
-                "For example, if one eye is painted, only edit that eye — never the other eye."
+                "Edit the WHOLE object that the painted region points to, even if only part of it was painted. "
+                "For example, if part of a dog is painted and the user asks to change its color, change the entire dog. "
+                "However, do NOT extend the edit to other separate objects — if one dog is painted, do not change a different dog."
             ),
             "auto": (
                 "Infer the edit scope from the user's wording and the image content. "
                 "Use a tight scope for tiny defects or text, a modest nearby scope for local area changes. "
-                "Only use a whole-object scope when the painted region clearly covers the entire object AND the user's request explicitly targets that whole object. "
-                "Never extend edits to symmetric, duplicate, or similar objects outside the painted region."
+                "Use a whole-object scope when the user's request clearly targets an entire object (e.g. 'change this dog's color', 'make this person wear a hat'). "
+                "Do not extend edits to separate, unrelated objects outside the painted region."
             ),
         }
         return guidance.get(scope_mode, guidance["auto"])
@@ -2441,11 +2441,24 @@ class ImageGenerator:
             scope_guidance = ImageGenerator._build_mask_scope_guidance(mask_scope_mode)
             if scope_guidance:
                 guard += scope_guidance + " "
+            # Adjust boundary strictness based on scope mode:
+            # - precise: strict pixel boundary (only change inside the painted mask)
+            # - range/object/auto: the mask is a pointer to the target, the model
+            #   may extend the edit to the whole relevant object/area
+            if mask_scope_mode == "precise":
+                guard += (
+                    "CRITICAL: The painted/red-highlighted region is a STRICT pixel boundary — you must ONLY modify content inside that region. "
+                    "Do NOT extend the edit to any area outside the painted region. "
+                    "Keep ALL areas outside the painted region pixel-identical to the original image. "
+                )
+            else:
+                guard += (
+                    "The painted/red-highlighted region indicates WHERE the user is pointing — it marks the target object or area. "
+                    "You may extend the edit to the whole relevant object or connected area that the painted region points to. "
+                    "For example, if the user paints part of a dog and asks to change its color, change the ENTIRE dog, not just the painted pixels. "
+                    "However, do NOT extend the edit to unrelated objects or areas that are clearly separate from the painted target. "
+                )
             guard += (
-                "CRITICAL: The painted/red-highlighted region is a STRICT boundary — you must ONLY modify content inside that region. "
-                "Do NOT extend the edit to any area outside the painted region, even if it seems logically connected or symmetric. "
-                "For example, if only one eye is painted, do NOT change the other eye. If only one hand is painted, do NOT change the other hand. "
-                "Keep ALL areas outside the painted region pixel-identical to the original image. "
                 "Preserve object count, geometry, placement, perspective, and lighting unless the user explicitly asks to change them. "
                 "If the user asks for only a color, material, texture, or text change, modify only that attribute and keep geometry and fine details unchanged. "
             )
@@ -3563,6 +3576,7 @@ class App(BaseTk):
         self._mask_composite_original_b64 = None
         self._mask_composite_mask_b64 = None
         self._mask_composite_uses_images_api = False
+        self._mask_composite_scope_mode = "auto"
         self._batch_request_size = None
         self._batch_api_quality = None
         self._pending_followups = []
@@ -6052,29 +6066,46 @@ class App(BaseTk):
         return b64, img
 
     def _apply_mask_composite(self, result_b64, result_img):
-        """Composite the API result with the original image using the mask.
+        """Composite the API result with the original image to preserve quality.
 
         When using the responses API (gpt-5.4 etc.), the entire image is
         regenerated — not just the masked region. This causes quality loss
         in non-masked areas. This function fixes that by keeping the original
-        pixels outside the mask and only using the API result inside the mask.
+        pixels outside the edited region and only using the API result where
+        the edit actually changed content.
 
-        Returns (b64, img) — the composited result.
+        Strategy depends on scope_mode:
+        - "precise": Strict mask boundary — only use API result inside the
+          painted mask, restore everything else to original.
+        - "range"/"object"/"auto": Diff-based dynamic compositing — detect
+          which regions the API actually changed (compared to the original)
+          and use the API result there, restoring only truly unchanged areas.
+          This allows the edit to extend to the whole object when the model
+          correctly interprets the user's intent (e.g. "make the dog red"
+          when only part of the dog was painted).
+
+        IMPORTANT: All compositing is done at the ORIGINAL image resolution
+        (before any downscaling by _prepare_result_for_output), so that
+        quality is preserved at full resolution.
+
+        Returns (b64, img) — the composited result at original resolution.
         """
         orig_b64 = self._mask_composite_original_b64
         mask_b64 = self._mask_composite_mask_b64
+        scope_mode = getattr(self, '_mask_composite_scope_mode', 'auto') or 'auto'
         if not orig_b64 or not mask_b64:
             return result_b64, result_img
 
         try:
             orig_img = ImageGenerator.b64_to_image(orig_b64).convert("RGB")
             mask_img = ImageGenerator.b64_to_image(mask_b64).convert("RGBA")
+            # Use the ORIGINAL image resolution as the target, NOT the
+            # (possibly downscaled) API result. This prevents progressive
+            # resolution loss across edit cycles.
+            target_size = orig_img.size
             result_rgb = result_img.convert("RGB")
-
-            # Ensure all images are the same size
-            target_size = result_rgb.size
-            if orig_img.size != target_size:
-                orig_img = orig_img.resize(target_size, Image.LANCZOS)
+            if result_rgb.size != target_size:
+                result_rgb = result_rgb.resize(target_size, Image.LANCZOS)
             if mask_img.size != target_size:
                 mask_img = mask_img.resize(target_size, Image.NEAREST)
 
@@ -6084,16 +6115,84 @@ class App(BaseTk):
             mask_alpha = mask_img.getchannel("A")
             editable_alpha = mask_alpha.point(lambda value: 255 - value)
 
-            # Composite: use result in editable region, original elsewhere
-            # editable_alpha as mask: where 255 (editable) -> use result, where 0 -> use original
-            composited = Image.composite(result_rgb, orig_img, editable_alpha.convert("L"))
+            if scope_mode == "precise":
+                # Strict mask boundary: only use API result inside the painted mask
+                composited = Image.composite(result_rgb, orig_img, editable_alpha.convert("L"))
+                debug_log.log("mask_composite_applied", {
+                    "strategy": "precise_strict_mask",
+                    "original_size": str(orig_img.size),
+                    "result_size": str(result_rgb.size),
+                    "mask_editable_pixels": str(sum(1 for p in editable_alpha.getdata() if p > 0)),
+                })
+            else:
+                # Diff-based dynamic compositing for range/object/auto modes.
+                # Detect which regions the API actually changed and use the API
+                # result there, restoring only truly unchanged areas to original.
+                import numpy as np
+                orig_arr = np.array(orig_img).astype(np.int16)
+                result_arr = np.array(result_rgb).astype(np.int16)
+                diff = np.abs(result_arr - orig_arr)
+                # Per-pixel change magnitude (sum of RGB diffs)
+                change_mag = diff.sum(axis=2)
+
+                # Threshold: pixels that changed significantly are considered "edited"
+                # Use a moderate threshold to filter out minor API noise while
+                # keeping genuine edits (including color changes on whole objects).
+                change_threshold = 50
+                changed_mask = change_mag > change_threshold
+
+                # Also ensure the painted mask region is always included in the
+                # "changed" area (the user explicitly painted there, so the API
+                # result should be used even if the diff is small).
+                editable_arr = np.array(editable_alpha.convert("L")) > 0
+                changed_mask = changed_mask | editable_arr
+
+                # Morphological dilation: expand the changed region slightly
+                # to include edges and nearby pixels that are part of the edit
+                # but may have smaller diffs (e.g. anti-aliased edges, shadows).
+                # A small fixed radius (2-3px) is sufficient to capture edges
+                # without polluting the background.
+                from PIL import ImageFilter
+                changed_pil = Image.fromarray((changed_mask.astype(np.uint8) * 255), mode='L')
+                dilate_radius = 2
+                dilated = changed_pil.filter(ImageFilter.MaxFilter(size=dilate_radius * 2 + 1))
+                dilated_arr = np.array(dilated) > 128
+
+                # Connectivity filter: only keep changed regions that are
+                # connected to the painted mask area. This removes isolated
+                # noise blobs in the background that happen to exceed the
+                # threshold but are not part of the intended edit.
+                try:
+                    from scipy import ndimage
+                    # Label connected components in the dilated mask
+                    labeled, num_features = ndimage.label(dilated_arr)
+                    # Find which labels overlap with the editable mask
+                    editable_labels = set(labeled[editable_arr].tolist()) - {0}
+                    # Keep only the connected components that overlap with the mask
+                    final_changed = np.isin(labeled, list(editable_labels))
+                except ImportError:
+                    # Fallback if scipy not available: just use the dilated mask
+                    # with an additional erosion step to remove thin noise bridges
+                    final_changed = dilated_arr
+
+                # Create composite: use API result where changed, original elsewhere
+                composite_alpha = Image.fromarray((final_changed.astype(np.uint8) * 255), mode='L')
+                composited = Image.composite(result_rgb, orig_img, composite_alpha)
+
+                changed_pixel_count = int(final_changed.sum())
+                total_pixels = target_size[0] * target_size[1]
+                debug_log.log("mask_composite_applied", {
+                    "strategy": f"diff_based_{scope_mode}",
+                    "original_size": str(orig_img.size),
+                    "result_size": str(result_rgb.size),
+                    "change_threshold": str(change_threshold),
+                    "dilate_radius": str(dilate_radius),
+                    "changed_pixels": str(changed_pixel_count),
+                    "changed_pct": f"{changed_pixel_count / total_pixels * 100:.1f}",
+                    "mask_editable_pixels": str(int(editable_arr.sum())),
+                })
 
             composited_b64 = ImageGenerator.image_to_b64(composited)
-            debug_log.log("mask_composite_applied", {
-                "original_size": str(orig_img.size),
-                "result_size": str(result_rgb.size),
-                "mask_editable_pixels": str(sum(1 for p in editable_alpha.getdata() if p > 0)),
-            })
             return composited_b64, composited
         except Exception as e:
             debug_log.log("mask_composite_error", str(e))
@@ -6461,10 +6560,13 @@ class App(BaseTk):
             self._mask_composite_original_b64 = images_b64[0]
             self._mask_composite_mask_b64 = mask_b64
             self._mask_composite_uses_images_api = False
+            # Infer scope mode from the user's prompt to decide compositing strategy
+            self._mask_composite_scope_mode = ImageGenerator._infer_mask_edit_scope(prompt)
         else:
             self._mask_composite_original_b64 = None
             self._mask_composite_mask_b64 = None
             self._mask_composite_uses_images_api = uses_images_api
+            self._mask_composite_scope_mode = "auto"
 
         debug_log.log("app_edit_size_plan", {
             "requested_output_size": size_setting,
@@ -8553,12 +8655,13 @@ class App(BaseTk):
         is_auto_style_job = current_job_label.startswith("正在应用风格:")
         job_succeeded = False
         try:
-            b64, img = self._prepare_result_for_output(b64, self._active_result_target_size)
-            # Apply mask compositing: for responses API (gpt-5.4 etc.), the entire
-            # image is regenerated, so we composite the result with the original to
-            # preserve non-masked pixels at full quality.
+            # Apply mask compositing BEFORE _prepare_result_for_output so that
+            # compositing happens at the original image resolution (not the
+            # potentially downscaled target size). This prevents progressive
+            # resolution loss across edit cycles.
             if self._mask_composite_original_b64 and self._mask_composite_mask_b64:
-                b64, img = self._apply_mask_composite(b64, img)
+                b64, img = self._apply_mask_composite(b64, img if img else ImageGenerator.b64_to_image(b64))
+            b64, img = self._prepare_result_for_output(b64, self._active_result_target_size)
             self._show_image(img)
             self.current_b64 = b64
             self._primary_is_result = True  # Mark the primary image as an AI-generated result
