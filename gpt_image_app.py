@@ -1481,6 +1481,40 @@ class ImageGenerator:
             return None
 
     @staticmethod
+    def _build_mask_base_image(image_b64, mask_b64):
+        """Create a base-color image with the masked region's original content pasted in.
+
+        This mimics the gpt-image-2 mask approach: the non-masked area is filled with
+        a neutral base color so the model clearly sees which region to edit, while the
+        masked (editable) region retains the original image content for reference.
+        """
+        info = ImageGenerator._get_mask_region_info(mask_b64)
+        if not info:
+            return None
+        try:
+            base = ImageGenerator.b64_to_image(image_b64).convert("RGBA")
+            if base.size != (info["width"], info["height"]):
+                base = base.resize((info["width"], info["height"]), Image.LANCZOS)
+
+            editable_alpha = info["editable_alpha"]
+
+            # Create a neutral gray base canvas
+            base_color = (128, 128, 128, 255)
+            canvas = Image.new("RGBA", base.size, base_color)
+
+            # Paste the original image content only in the editable (masked) region
+            # editable_alpha: 255 where user painted (editable), 0 elsewhere
+            mask_rgba = Image.new("RGBA", base.size, (0, 0, 0, 0))
+            mask_rgba.putalpha(editable_alpha)
+
+            # Composite: canvas as background, original image visible only through mask
+            result = Image.composite(base, canvas, editable_alpha.convert("L"))
+
+            return ImageGenerator.image_to_b64(result, fmt="PNG")
+        except Exception:
+            return None
+
+    @staticmethod
     def _infer_mask_edit_scope(prompt):
         text = str(prompt or "")
         lower_text = text.lower()
@@ -1545,7 +1579,7 @@ class ImageGenerator:
     @staticmethod
     def _build_edit_image_slot_layout(additional_reference_count=0,
                                       has_mask_reference=False,
-                                      has_mask_focus_crop=False):
+                                      has_mask_base_image=False):
         next_index = 2
         user_image_start = next_index if additional_reference_count > 0 else None
         user_image_end = (next_index + additional_reference_count - 1) if additional_reference_count > 0 else None
@@ -1553,12 +1587,12 @@ class ImageGenerator:
         mask_reference_index = next_index if has_mask_reference else None
         if has_mask_reference:
             next_index += 1
-        mask_focus_index = next_index if has_mask_focus_crop else None
+        mask_base_index = next_index if has_mask_base_image else None
         return {
             "user_image_start": user_image_start,
             "user_image_end": user_image_end,
             "mask_reference_index": mask_reference_index,
-            "mask_focus_index": mask_focus_index,
+            "mask_base_index": mask_base_index,
         }
 
     @staticmethod
@@ -1594,14 +1628,14 @@ class ImageGenerator:
     @staticmethod
     def _build_multi_image_role_guidance(prompt, additional_reference_count,
                                          has_mask_reference=False,
-                                         has_mask_focus_crop=False):
+                                         has_mask_base_image=False):
         if additional_reference_count <= 0:
             return None
 
         layout = ImageGenerator._build_edit_image_slot_layout(
             additional_reference_count=additional_reference_count,
             has_mask_reference=has_mask_reference,
-            has_mask_focus_crop=has_mask_focus_crop,
+            has_mask_base_image=has_mask_base_image,
         )
         intent = ImageGenerator._infer_multi_image_prompt_intent(prompt)
 
@@ -1661,10 +1695,11 @@ class ImageGenerator:
                 f"Image {layout['mask_reference_index']} is an app-generated copy of image 1 with the masked editable region highlighted in red. "
                 "It is a localization guide, not an extra user-supplied image, and not the image that should be edited or returned as the final output."
             )
-        if has_mask_focus_crop:
+        if has_mask_base_image:
             parts.append(
-                f"Image {layout['mask_focus_index']} is an app-generated zoomed crop around the painted selection and its nearby context. "
-                "It is only a focus aid for localizing the target in image 1, and not the image that should be edited or returned as the final output."
+                f"Image {layout['mask_base_index']} is an app-generated base image where the gray area marks the region to preserve and the original content is visible only in the editable (painted) region. "
+                "Use it to clearly identify which area to edit (the content region) versus which area to leave unchanged (the gray region). "
+                "Do not edit or return this image itself as the final output."
             )
         return " ".join(parts)
 
@@ -1829,17 +1864,16 @@ class ImageGenerator:
         mask_scope_mode = self._infer_mask_edit_scope(prompt) if mask_b64 else "auto"
         mask_guidance = self._build_mask_region_guidance(mask_comp or mask_b64)
         mask_reference_b64 = self._build_mask_reference_image(comp_b64, mask_comp or mask_b64) if mask_b64 else None
-        mask_focus_crop_b64 = self._build_mask_focus_crop_image(
+        mask_base_b64 = self._build_mask_base_image(
             comp_b64,
             mask_comp or mask_b64,
-            scope_mode=mask_scope_mode,
         ) if mask_b64 else None
         edit_prompt = self._build_responses_edit_prompt(
             prompt,
             bool(mask_b64),
             mask_guidance,
             has_mask_reference=bool(mask_reference_b64),
-            has_mask_focus_crop=bool(mask_focus_crop_b64),
+            has_mask_base_image=bool(mask_base_b64),
             mask_scope_mode=mask_scope_mode,
         )
         # ── Debug logging: edit request construction ──
@@ -1861,7 +1895,7 @@ class ImageGenerator:
             "responses_model": responses_model,
             "route": "/responses:image_generation:edit",
             "has_mask_reference_image": str(bool(mask_reference_b64)),
-            "has_mask_focus_crop_image": str(bool(mask_focus_crop_b64)),
+            "has_mask_base_image": str(bool(mask_base_b64)),
             "mask_scope_mode": mask_scope_mode,
         })
         if ignored_prev_id:
@@ -1900,11 +1934,11 @@ class ImageGenerator:
                 " A second guide image of the same source is provided with the painted selection highlighted in red. "
                 "Use that guide image only to localize the target region more precisely. Do not edit or return that guide image itself."
             )
-        if mask_focus_crop_b64:
+        if mask_base_b64:
             instructions += (
-                " A third zoomed crop around that highlighted region is also provided. "
-                "Use the crop to understand the local target and nearby context, then apply the requested edit back onto image 1. "
-                "Do not edit or return the crop itself as the final image."
+                " A third base image is provided where the gray area marks the region to preserve and the original content is visible only in the editable (painted) region. "
+                "Use it to clearly identify which area to edit versus which area to leave unchanged. "
+                "Do not edit or return the base image itself as the final image."
             )
 
         content = [
@@ -1913,8 +1947,8 @@ class ImageGenerator:
         ]
         if mask_reference_b64:
             content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_reference_b64}"})
-        if mask_focus_crop_b64:
-            content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_focus_crop_b64}"})
+        if mask_base_b64:
+            content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_base_b64}"})
 
         body = {
             "model": responses_model,
@@ -1984,23 +2018,22 @@ class ImageGenerator:
         mask_scope_mode = self._infer_mask_edit_scope(prompt) if mask_b64 else "auto"
         mask_guidance = self._build_mask_region_guidance(mask_comp or mask_b64)
         mask_reference_b64 = self._build_mask_reference_image(comp_b64_primary, mask_comp or mask_b64) if mask_b64 and images_b64 else None
-        mask_focus_crop_b64 = self._build_mask_focus_crop_image(
+        mask_base_b64 = self._build_mask_base_image(
             comp_b64_primary,
             mask_comp or mask_b64,
-            scope_mode=mask_scope_mode,
         ) if mask_b64 and images_b64 else None
         additional_reference_count = max(0, len(images_b64) - 1)
         layout = self._build_edit_image_slot_layout(
             additional_reference_count=additional_reference_count,
             has_mask_reference=bool(mask_reference_b64),
-            has_mask_focus_crop=bool(mask_focus_crop_b64),
+            has_mask_base_image=bool(mask_base_b64),
         )
         content = [{"type": "input_text", "text": self._build_responses_edit_prompt(
             prompt,
             bool(mask_b64),
             mask_guidance,
             has_mask_reference=bool(mask_reference_b64),
-            has_mask_focus_crop=bool(mask_focus_crop_b64),
+            has_mask_base_image=bool(mask_base_b64),
             additional_reference_count=additional_reference_count,
             mask_scope_mode=mask_scope_mode,
         )}]
@@ -2017,8 +2050,8 @@ class ImageGenerator:
                 content.append({"type": "input_image", "image_url": f"data:{mime};base64,{comp_b64}"})
             if mask_reference_b64:
                 content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_reference_b64}"})
-            if mask_focus_crop_b64:
-                content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_focus_crop_b64}"})
+            if mask_base_b64:
+                content.append({"type": "input_image", "image_url": f"data:image/png;base64,{mask_base_b64}"})
         else:
             for idx, b64 in enumerate(images_b64):
                 target_size = process_size_tuple if idx == 0 else None
@@ -2073,10 +2106,10 @@ class ImageGenerator:
                 f" Image {layout['mask_reference_index']} is an app-generated copy of image 1 with the painted selection highlighted in red. "
                 "Use it only as a localization guide. Do not edit or return that guide image itself."
             )
-        if mask_focus_crop_b64:
+        if mask_base_b64:
             instructions += (
-                f" Image {layout['mask_focus_index']} is an app-generated zoomed crop around the painted selection and nearby context. "
-                "Use it only as a focus reference. Do not edit or return that crop itself as the final image."
+                f" Image {layout['mask_base_index']} is an app-generated base image where the gray area marks the region to preserve and the original content is visible only in the editable (painted) region. "
+                "Use it to clearly identify which area to edit versus which area to leave unchanged. Do not edit or return that base image itself as the final image."
             )
 
         body = {
@@ -2361,7 +2394,7 @@ class ImageGenerator:
     @staticmethod
     def _build_responses_edit_prompt(prompt, has_mask, mask_guidance=None,
                                      has_mask_reference=False,
-                                     has_mask_focus_crop=False,
+                                     has_mask_base_image=False,
                                      additional_reference_count=0,
                                      mask_scope_mode="auto"):
         guard = (
@@ -2374,7 +2407,7 @@ class ImageGenerator:
             layout = ImageGenerator._build_edit_image_slot_layout(
                 additional_reference_count=additional_reference_count,
                 has_mask_reference=has_mask_reference,
-                has_mask_focus_crop=has_mask_focus_crop,
+                has_mask_base_image=has_mask_base_image,
             )
             guard += (
                 "Image 1 is the original source image to edit and the default final output canvas. "
@@ -2385,7 +2418,7 @@ class ImageGenerator:
                     prompt,
                     additional_reference_count,
                     has_mask_reference=has_mask_reference,
-                    has_mask_focus_crop=has_mask_focus_crop,
+                    has_mask_base_image=has_mask_base_image,
                 )
                 if multi_guidance:
                     guard += multi_guidance + " "
@@ -2396,11 +2429,11 @@ class ImageGenerator:
                         f"Use image {layout['mask_reference_index']} only to identify the target area in image 1; do not copy stylistic artifacts from the guide overlay, "
                         f"and do not edit or return image {layout['mask_reference_index']} as the final picture. "
                     )
-                if has_mask_focus_crop:
+                if has_mask_base_image:
                     guard += (
-                        f"Image {layout['mask_focus_index']} is a zoomed crop around that same highlighted region. "
-                        f"Use image {layout['mask_focus_index']} to understand the local target and nearby context, then apply the requested change back to image 1 at the intended location. "
-                        f"Do not edit or return image {layout['mask_focus_index']} itself as the final picture. "
+                        f"Image {layout['mask_base_index']} is a base image where the gray area marks the region to preserve and the original content is visible only in the editable (painted) region. "
+                        f"Use image {layout['mask_base_index']} to clearly identify which area to edit (the content region) versus which area to leave unchanged (the gray region). "
+                        f"Do not edit or return image {layout['mask_base_index']} itself as the final picture. "
                     )
             scope_guidance = ImageGenerator._build_mask_scope_guidance(mask_scope_mode)
             if scope_guidance:
