@@ -3557,6 +3557,12 @@ class App(BaseTk):
         self._active_result_target_size = None
         self._active_processing_size = None
         self._batch_result_target_size = None
+        # For mask compositing: preserve original pixels outside the mask
+        # when using the responses API (gpt-5.4 etc.) which regenerates
+        # the entire image instead of only the masked region.
+        self._mask_composite_original_b64 = None
+        self._mask_composite_mask_b64 = None
+        self._mask_composite_uses_images_api = False
         self._batch_request_size = None
         self._batch_api_quality = None
         self._pending_followups = []
@@ -6045,6 +6051,54 @@ class App(BaseTk):
             b64 = ImageGenerator.image_to_b64(img)
         return b64, img
 
+    def _apply_mask_composite(self, result_b64, result_img):
+        """Composite the API result with the original image using the mask.
+
+        When using the responses API (gpt-5.4 etc.), the entire image is
+        regenerated — not just the masked region. This causes quality loss
+        in non-masked areas. This function fixes that by keeping the original
+        pixels outside the mask and only using the API result inside the mask.
+
+        Returns (b64, img) — the composited result.
+        """
+        orig_b64 = self._mask_composite_original_b64
+        mask_b64 = self._mask_composite_mask_b64
+        if not orig_b64 or not mask_b64:
+            return result_b64, result_img
+
+        try:
+            orig_img = ImageGenerator.b64_to_image(orig_b64).convert("RGB")
+            mask_img = ImageGenerator.b64_to_image(mask_b64).convert("RGBA")
+            result_rgb = result_img.convert("RGB")
+
+            # Ensure all images are the same size
+            target_size = result_rgb.size
+            if orig_img.size != target_size:
+                orig_img = orig_img.resize(target_size, Image.LANCZOS)
+            if mask_img.size != target_size:
+                mask_img = mask_img.resize(target_size, Image.NEAREST)
+
+            # Extract the editable alpha from the mask
+            # In the mask: alpha=255 means preserve (opaque), alpha=0 means editable (transparent)
+            # editable_alpha: 255 where user painted (editable), 0 elsewhere
+            mask_alpha = mask_img.getchannel("A")
+            editable_alpha = mask_alpha.point(lambda value: 255 - value)
+
+            # Composite: use result in editable region, original elsewhere
+            # editable_alpha as mask: where 255 (editable) -> use result, where 0 -> use original
+            composited = Image.composite(result_rgb, orig_img, editable_alpha.convert("L"))
+
+            composited_b64 = ImageGenerator.image_to_b64(composited)
+            debug_log.log("mask_composite_applied", {
+                "original_size": str(orig_img.size),
+                "result_size": str(result_rgb.size),
+                "mask_editable_pixels": str(sum(1 for p in editable_alpha.getdata() if p > 0)),
+            })
+            return composited_b64, composited
+        except Exception as e:
+            debug_log.log("mask_composite_error", str(e))
+            return result_b64, result_img
+
     def _create_generator(self):
         self._save_config()
         gen = ImageGenerator(
@@ -6393,6 +6447,21 @@ class App(BaseTk):
         request_size = size_plan["processing_size"]
         self._active_result_target_size = size_plan["output_size"]
         self._active_processing_size = size_plan["processing_size_tuple"]
+
+        # Save mask compositing data: when using the responses API (gpt-5.4 etc.)
+        # the entire image is regenerated, so non-masked areas lose quality.
+        # We preserve the original image and mask so we can composite the result
+        # after the API returns — keeping original pixels outside the mask.
+        uses_images_api = bool(self._resolve_image_tool_model())
+        if mask_b64 and images_b64 and not uses_images_api:
+            self._mask_composite_original_b64 = images_b64[0]
+            self._mask_composite_mask_b64 = mask_b64
+            self._mask_composite_uses_images_api = False
+        else:
+            self._mask_composite_original_b64 = None
+            self._mask_composite_mask_b64 = None
+            self._mask_composite_uses_images_api = uses_images_api
+
         debug_log.log("app_edit_size_plan", {
             "requested_output_size": size_setting,
             "final_output_size": size_plan["output_size_text"],
@@ -8481,11 +8550,18 @@ class App(BaseTk):
         job_succeeded = False
         try:
             b64, img = self._prepare_result_for_output(b64, self._active_result_target_size)
+            # Apply mask compositing: for responses API (gpt-5.4 etc.), the entire
+            # image is regenerated, so we composite the result with the original to
+            # preserve non-masked pixels at full quality.
+            if self._mask_composite_original_b64 and self._mask_composite_mask_b64:
+                b64, img = self._apply_mask_composite(b64, img)
             self._show_image(img)
             self.current_b64 = b64
             self._primary_is_result = True  # Mark the primary image as an AI-generated result
 
             # Reset mask after edit — the old mask belongs to the previous image.
+            self._mask_composite_original_b64 = None
+            self._mask_composite_mask_b64 = None
             if self._mask_mode:
                 self._mask_mode = False
                 self._mask_b64 = None
