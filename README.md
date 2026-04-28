@@ -531,6 +531,12 @@ pyinstaller GPT图片生成器.spec
 
 ---
 
+## 致谢
+
+- **[Linux DO](https://linux.do/)**：真诚 · 友善 · 团结 · 专业
+
+---
+
 ## License
 
 本项目使用 [MIT License](LICENSE)。

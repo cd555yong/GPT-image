@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFilter
 
 try:
     from PIL import ImageGrab
@@ -390,14 +390,16 @@ class ImageGenerator:
         # Typical 1024px image inputs are often 1-3MB as base64. Compressing them
         # before the first attempt hurts edit fidelity, so only shrink truly large
         # request bodies and keep retry-time degradation as the fallback.
-        MAX_BODY_KB = 4096
+        MAX_BODY_KB = 20480  # 20 MB — only compress when body is truly enormous
+        # Per-image b64 limit: API实测可接受~17MB单图，留余量设15MB
+        MAX_PER_IMAGE_B64_KB = 15360
         try:
             body_size_kb = len(json.dumps(body)) / 1024
             if body_size_kb > MAX_BODY_KB:
                 input_type = "edit" if isinstance(body.get("input"), list) else "generate"
                 if input_type == "edit":
                     # Proactively compress images only when the request is too large.
-                    self._degrade_input_images(body, max_dim=1024, max_b64_kb=200)
+                    self._degrade_input_images(body, max_dim=3840, max_b64_kb=MAX_PER_IMAGE_B64_KB)
                     if "previous_response_id" in body:
                         del body["previous_response_id"]
                     new_size_kb = len(json.dumps(body)) / 1024
@@ -421,7 +423,7 @@ class ImageGenerator:
                 degraded.append("removed_previous_response_id")
             if attempt >= 3:
                 try:
-                    self._degrade_input_images(body, max_dim=1024, max_b64_kb=200)
+                    self._degrade_input_images(body, max_dim=3840, max_b64_kb=15360)
                     degraded.append("degraded_images")
                 except Exception:
                     pass
@@ -756,7 +758,7 @@ class ImageGenerator:
                 degraded.append("removed_previous_response_id")
             if attempt >= 3:
                 try:
-                    self._degrade_input_images(fallback_body, max_dim=1024, max_b64_kb=200)
+                    self._degrade_input_images(fallback_body, max_dim=3840, max_b64_kb=15360)
                     degraded.append("degraded_images")
                 except Exception:
                     pass
@@ -2640,7 +2642,7 @@ class ImageGenerator:
 
         return best_b64, best_mime
 
-    def _degrade_input_images(self, body, max_dim=1024, max_b64_kb=200):
+    def _degrade_input_images(self, body, max_dim=3840, max_b64_kb=15360):
         """Re-compress input images in the request body more aggressively for retry attempts.
         
         This modifies the body in-place, replacing large base64 images with
@@ -5994,7 +5996,16 @@ class App(BaseTk):
         img = ImageGenerator.b64_to_image(b64)
         target_tuple = ImageGenerator._parse_size_tuple(target_size)
         if target_tuple and img.size != target_tuple:
+            src_pixels = img.size[0] * img.size[1]
+            dst_pixels = target_tuple[0] * target_tuple[1]
             img = img.resize(target_tuple, Image.LANCZOS)
+            # Apply Unsharp Mask after downscaling to compensate for
+            # the softening that LANCZOS downsampling inherently causes.
+            # Only apply when actually downscaling (dst < src).
+            if dst_pixels < src_pixels:
+                img = img.filter(ImageFilter.UnsharpMask(
+                    radius=2, percent=150, threshold=3
+                ))
             b64 = ImageGenerator.image_to_b64(img)
         return b64, img
 
