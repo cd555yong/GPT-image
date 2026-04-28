@@ -6452,7 +6452,11 @@ class App(BaseTk):
         # the entire image is regenerated, so non-masked areas lose quality.
         # We preserve the original image and mask so we can composite the result
         # after the API returns — keeping original pixels outside the mask.
-        uses_images_api = bool(self._resolve_image_tool_model())
+        # Use the resolved model name to detect images API (gpt-image-* / chatgpt-image-latest).
+        _model_id = self._resolve_model_api_id()
+        uses_images_api = bool(
+            _model_id.startswith("gpt-image") or _model_id == "chatgpt-image-latest"
+        )
         if mask_b64 and images_b64 and not uses_images_api:
             self._mask_composite_original_b64 = images_b64[0]
             self._mask_composite_mask_b64 = mask_b64
