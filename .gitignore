@@ -13,6 +13,8 @@ env/
 
 build/
 dist/
+build_model_fix/
+dist_model_fix/
 
 config.json
 
