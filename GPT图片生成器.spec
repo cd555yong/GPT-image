@@ -5,7 +5,7 @@ from pathlib import Path
 import tkinterdnd2
 
 
-project_root = Path(__file__).resolve().parent
+project_root = Path(SPECPATH).resolve()
 tkdnd_dir = Path(tkinterdnd2.__file__).resolve().parent / "tkdnd"
 tkdnd_datas = []
 if tkdnd_dir.exists():
